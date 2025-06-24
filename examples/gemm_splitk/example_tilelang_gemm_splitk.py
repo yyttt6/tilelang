@@ -3,7 +3,8 @@
 
 import tilelang
 import tilelang.language as T
-
+from tilelang.cache import clear_cache
+clear_cache()
 
 @tilelang.jit
 def matmul(M,

@@ -34,14 +34,14 @@ def atomic_addx2(dst: Buffer, value: PrimExpr) -> PrimExpr:
 
 
 def atomic_addx4(dst: Buffer, value: PrimExpr) -> PrimExpr:
-    """Perform an atomic addition operation with double-width operands.
+    """Perform an atomic addition operation with quad-width operands.
 
     Args:
         dst (Buffer): Destination buffer where the atomic addition will be performed
-        value (PrimExpr): Value to be atomically added (double-width)
+        value (PrimExpr): Value to be atomically added (quad-width)
 
     Returns:
-        PrimExpr: Handle to the double-width atomic addition operation
+        PrimExpr: Handle to the quad-width atomic addition operation
     """
     return T.call_extern("handle", "AtomicAddx4", T.address_of(dst), T.address_of(value))
 
