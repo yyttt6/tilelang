@@ -37,6 +37,17 @@ def PipelinePlanning():
     return _ffi_api.PipelinePlanning()  # type: ignore
 
 
+def VectorizeAtomicAdd():
+    """VectorizeAtomicAdd
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.VectorizeAtomicAdd() # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 

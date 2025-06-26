@@ -72,10 +72,14 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.FrontendLegalize()(mod)
     # Simplify the IR expressions
     mod = tir.transform.Simplify()(mod)
+    # Vectorize the Atomic-add operation 
+    mod = tilelang.transform.VectorizeAtomicAdd()(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    # # Vectorize the Atomic-add operation 
+    # mod = tilelang.transform.VectorizeAtomicAdd()(mod)
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
     # Legalize vectorized loops to ensure they are valid

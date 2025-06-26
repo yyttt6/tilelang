@@ -18,18 +18,16 @@
  */
 
 /*!
- * \file loop_vectorize.cc
- * \brief A tool to automatically vectorize a for loop
+ * \file atomicadd_vectorize.cc
+ * \brief A tool to automatically vectorize atomic add
  */
-
-#include "loop_vectorize.h"
 
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
-
+#include <tvm/arith/analyzer.h>
+#include <tvm/tir/op.h>
 #include <numeric>
-
 #include "../layout/layout.h"
 #include "../layout/utils.h"
 #include "arith/int_operator.h"
@@ -40,12 +38,89 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+using arith::IRMutatorWithAnalyzer;
+using arith::IRVisitorWithAnalyzer;
+
 
 struct AtomicAddVectorizePlanResult {
   int vector_size;
   bool dynamic;
   PrimExpr condition;
 };
+
+class ForCollector : public IRVisitorWithAnalyzer {
+public:
+  static Map<For, Fragment> Run(const PrimFunc &f) {
+    ForCollector collector;
+    for (const auto &[_, buffer] : f->buffer_map) {
+      collector.buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    collector.operator()(f->body);
+    Map<For, Fragment> for_map;
+    for (int i = 0; i < collector.infer_list_.size(); i++) {
+      std::unique_ptr<Operator> base_infer = std::move(collector.infer_list_[i]);
+
+      // Check if base_infer is valid
+      ICHECK(base_infer != nullptr) << "Null pointer encountered in "
+                                       "infer_list_ while collecting for_map.";
+      if (auto for_infer = dynamic_cast<ParallelOp *>(base_infer.get())) {
+        // Check that the loop layout is defined
+        // ICHECK(for_infer->GetLoopLayout().defined())
+        //     << "The Layout for Parallel for cannot be inferred correctly:\n"
+        //     << for_infer->GetRoot();
+        for_map.Set(for_infer->GetRoot(), for_infer->GetLoopLayout());
+      }
+    }
+    return for_map;
+  }
+
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    IRVisitorWithAnalyzer::VisitExpr_(op);
+    // Do not analysis the call node to the global function.
+    if (op->op.as<GlobalVarNode>())
+      return;
+
+    auto p = ParseOperator(GetRef<Call>(op), buffer_data_to_buffer_);
+    if (p != nullptr) {
+      infer_list_.push_back(std::move(p));
+    }
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    if (op->kind == ForKind::kParallel) {
+      auto infer = std::make_unique<ParallelOp>(GetRef<For>(op));
+      infer_list_.push_back(std::move(infer));
+    } else {
+      IRVisitorWithAnalyzer::VisitStmt(op->body);
+    }
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (auto buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    if (op->annotations.count(attr::kLayoutMap)) {
+      // Check if the layout map is Map<Var, Layout>
+      auto map = op->annotations.Get(attr::kLayoutMap).as< Map<Var, Layout> >();
+      ICHECK(map.defined()) << "layout map is not defined";
+      ICHECK(map.value().defined()) << "layout map is not defined";
+
+      for (const auto &[var, layout] : map.value()) {
+        ICHECK(buffer_data_to_buffer_.count(var))
+            << "buffer " << var << " is not found in the block";
+        auto buffer = buffer_data_to_buffer_[var];
+        ICHECK(StructuralEqual()(layout->InputShape(), buffer->shape));
+      }
+    }
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
+
+  Map<Var, Buffer> buffer_data_to_buffer_;
+  std::vector<std::unique_ptr<Operator>> infer_list_;
+};
+
 
 class AtomicAddVectorizePlanner : public arith::IRVisitorWithAnalyzer {
 public:
@@ -230,19 +305,117 @@ private:
   const bool dynamic_;
 };
 
-
-For VectorizeAtomicAdd(const For &loop, int vectorize_hint) {
-  AtomicAddVectorizePlanResult res = {1, false, 0};
-  if (vectorize_hint != 1) {
-    AtomicAddVectorizePlanner planner;
-    AtomicAddVectorizePlanResult res = planner.Plan(loop, vectorize_hint);
-    vectorize_hint = res.vector_size;
-  }
-  if (vectorize_hint == 1)
-    return loop;
-  auto rewriter = AtomicAddVectorizeRewriter(res);
-  return Downcast<For>(rewriter(loop));
+static int GetArchInt(Target target) {
+  int arch_int = 0;
+  auto s = target->GetAttr<String>("arch");
+  ICHECK(s.defined());
+  const char *arch_str = s.value().c_str();
+  ICHECK_EQ(arch_str[0], 's');
+  ICHECK_EQ(arch_str[1], 'm');
+  ICHECK_EQ(arch_str[2], '_');
+  arch_int = atoi(&arch_str[3]);
+  return arch_int;
 }
+
+class AutomicAddVectorizer : public IRMutatorWithAnalyzer {
+public:
+  static tvm::tir::PrimFunc Substitute(PrimFunc f) {
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    Map<For, Fragment> for_map = ForCollector::Run(f);
+    
+    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    ICHECK(target.defined())
+        << "Layout_Inference: Require the target attribute";
+    int arch_int = GetArchInt(target.value());
+    arith::Analyzer analyzer;
+    AutomicAddVectorizer substituter(for_map, arch_int, &analyzer);
+    fptr->body = substituter.VisitStmt(fptr->body);
+    return f;
+  }
+private:
+
+  AutomicAddVectorizer(const Map<For, Fragment> for_map, int arch_int, arith::Analyzer *analyzer)
+    : arith::IRMutatorWithAnalyzer(analyzer), for_map_(for_map), arch_int_(arch_int){};
+
+  int GetVectorizeSizeMax(DataType dtype) {
+
+    int compute_capability = arch_int_;
+    LOG(INFO) << "compute_capability " << compute_capability << "\n";
+
+    if (dtype == DataType::Float(16)) {
+      return 2;
+    }
+    if (dtype == DataType::BFloat(16)) {
+      if (compute_capability > 75) {
+        return 2;
+      } else {
+        return 1;
+      }
+    }
+    if (dtype == DataType::Float(32)) {
+      if (compute_capability >= 90) {
+        return 4;
+      } else {
+        return 1;
+      }
+    }
+    return 1;
+  }
+
+  Stmt VisitStmt_(const ForNode* op) final {
+    For for_node = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    
+    if (for_map_.count(GetRef<For>(op))) {
+      int vectorize_size_max = 1;
+
+      PostOrderVisit(for_node->body, [&](const ObjectRef& obj) {
+        if (const auto* call = obj.as<CallNode>()) {
+          if (call->op == builtin::call_extern() && call->args.size() >= 2) {
+            const auto* func_name = call->args[0].as<StringImmNode>();
+            if (func_name->value == "AtomicAdd") {
+              DataType dtype = call->args[1].as<CallNode>()->args[0].as<BufferLoadNode>()->dtype;
+              vectorize_size_max = GetVectorizeSizeMax(dtype);
+              LOG(INFO) << "vectorize_size_max " << vectorize_size_max << "\n";
+            }
+          }
+        }
+      });
+
+      if (vectorize_size_max != 1) {
+        int vectorize_hint = vectorize_size_max;
+        
+        AtomicAddVectorizePlanResult res = {1, false, 0};
+        if (vectorize_hint != 1) {
+          AtomicAddVectorizePlanner planner;
+          AtomicAddVectorizePlanResult res = planner.Plan(for_node, vectorize_hint);
+          vectorize_hint = res.vector_size;
+        }
+        if (vectorize_hint == 1)
+          return for_node;
+        auto rewriter = AtomicAddVectorizeRewriter(res);
+        return Downcast<For>(rewriter(for_node));
+      }
+    }
+    
+    return for_node;
+  }
+  
+private:
+  int arch_int_;
+  const Map<For, Fragment> for_map_;
+};
+
+tvm::transform::Pass VectorizeAtomicAdd() {
+  using namespace tir::transform;
+
+  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+    return AutomicAddVectorizer::Substitute(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.VectorizeAtomicAdd", {});
+}
+
+TVM_REGISTER_GLOBAL("tl.transform.VectorizeAtomicAdd")
+    .set_body_typed(VectorizeAtomicAdd);
 
 } // namespace tl
 } // namespace tvm
