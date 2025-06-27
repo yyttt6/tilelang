@@ -14,7 +14,6 @@
 #include <tvm/tir/utils.h>
 
 #include <queue>
-#include <cuda_runtime.h>
 
 #include "../op/parallel.h"
 #include "arith/ir_mutator_with_analyzer.h"
@@ -22,7 +21,6 @@
 #include "common/loop_fusion_utils.h"
 #include "loop_partition.h"
 #include "loop_vectorize.h"
-#include "atomicadd_vectorize.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -544,84 +542,6 @@ private:
   bool skip_thread_partition_{false};
 };
 
-static int GetComputeCapability() {
-  static int capability = -1;
-  if (capability != -1) return capability;
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-  capability = prop.major * 10 + prop.minor;
-  return capability;
-}
-
-class AutomicAddVectorizer : public IRMutatorWithAnalyzer {
-public:
-  static tir::Stmt Substitute(PrimFuncNode *fptr, const LayoutInferenceResult result) {
-    arith::Analyzer analyzer;
-    AutomicAddVectorizer substituter(result, &analyzer);
-    fptr->body = substituter.VisitStmt(fptr->body);
-    return fptr->body;
-  }
-private:
-
-  int GetVectorizeSizeMax(DataType dtype) {
-
-    int compute_capability = GetComputeCapability();
-    LOG(INFO) << "compute_capability " << compute_capability << "\n";
-
-    if (dtype == DataType::Float(16)) {
-      return 2;
-    }
-    if (dtype == DataType::BFloat(16)) {
-      if (compute_capability > 75) {
-        return 2;
-      } else {
-        return 1;
-      }
-    }
-    if (dtype == DataType::Float(32)) {
-      if (compute_capability >= 90) {
-        return 4;
-      } else {
-        return 1;
-      }
-    }
-    return 1;
-  }
-
-  AutomicAddVectorizer(const LayoutInferenceResult result, arith::Analyzer *analyzer)
-    : arith::IRMutatorWithAnalyzer(analyzer), result_(result){};
-
-  Stmt VisitStmt_(const ForNode* op) final {
-    For for_node = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    
-    if (result_.for_map.count(GetRef<For>(op))) {
-      int vectorize_size_max = 1;
-
-      PostOrderVisit(for_node->body, [&](const ObjectRef& obj) {
-        if (const auto* call = obj.as<CallNode>()) {
-          if (call->op == builtin::call_extern() && call->args.size() >= 2) {
-            const auto* func_name = call->args[0].as<StringImmNode>();
-            if (func_name->value == "AtomicAdd") {
-              DataType dtype = call->args[1].as<CallNode>()->args[0].as<BufferLoadNode>()->dtype;
-              vectorize_size_max = GetVectorizeSizeMax(dtype);
-              LOG(INFO) << "vectorize_size_max " << vectorize_size_max << "\n";
-            }
-          }
-        }
-      });
-
-      if (vectorize_size_max != 1) {
-        for_node = VectorizeAtomicAdd(for_node, vectorize_size_max);
-      }
-    }
-    
-    return for_node;
-  }
-  
-private:
-  const LayoutInferenceResult result_;
-};
-
 class LayoutInferencer : public IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
@@ -632,7 +552,6 @@ public:
     collector.Collect(f);
     auto result = collector.Run();
     LayoutInferencer substituter(result, skip_thread_partition, &analyzer);
-    fptr->body = AutomicAddVectorizer::Substitute(fptr, result);
     fptr->body = substituter.VisitStmt(f->body);
     return f;
   }
