@@ -325,8 +325,8 @@ def benchmark(B=1,
                 indices[b, t, h, :len(i_i)] = i_i
 
     is_casual = True
-    batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_kv, kv_group, _ = kv.shape
+    _, _, heads, dim_plus_tail_dim = q.shape
+    _, _, kv_group, _ = kv.shape
     dim = 512
     tail_dim = dim_plus_tail_dim - dim
     _, _, _, topk = indices.shape

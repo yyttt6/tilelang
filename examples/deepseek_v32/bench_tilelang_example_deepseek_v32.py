@@ -24,8 +24,7 @@ def bench_sparse_mla_fwd():
         HKV=1,
         DQK=576,
         DV=512,
-        topk=256,
-        check_correctness=False)
+        topk=256)
 
 
 def bench_sparse_mla_fwd_pipelined():
@@ -37,8 +36,7 @@ def bench_sparse_mla_fwd_pipelined():
         HKV=1,
         DQK=576,
         DV=512,
-        topk=256,
-        check_correctness=False)
+        topk=256)
 
 
 def bench_sparse_mla_bwd():

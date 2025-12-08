@@ -465,8 +465,7 @@ def benchmark(B=1,
               DV=512,
               topk=2048,
               dtype=torch.bfloat16,
-              q_start_s_index=1024,
-              check_correctness=True):
+              q_start_s_index=1024):
     KV_stride = 1
 
     torch.random.manual_seed(0)
@@ -482,29 +481,20 @@ def benchmark(B=1,
                 i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // KV_stride)), SKV))[:topk]
                 indices[b, t, h, :len(i_i)] = i_i
 
-    kernel = sparse_mla_fwd_interface(
-        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
-
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
     _, seq_len_kv, kv_group, _ = kv.shape
-    sm_scale = None
-    is_casual = True
-    return_kernel = False
-    print_kernel = False
     dim = 512
     tail_dim = dim_plus_tail_dim - dim
-    _, _, _, topk = indices.shape
     CP0 = q_start_s_index == 0
-
     kernel = sparse_mla_fwd(batch, seq_len, seq_len_kv, heads, dim, tail_dim, topk, KV_stride,
-                            kv_group, sm_scale, is_casual, CP0)
+                            kv_group, None, True, CP0)
 
-    def ran_kernel_only():
+    def run_kernel_only():
         kernel(q, kv, indices, torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda"))
 
     from tilelang.profiler import do_bench
     return do_bench(
-        ran_kernel_only,
+        run_kernel_only,
         rep=100,
         warmup=10,
     )
