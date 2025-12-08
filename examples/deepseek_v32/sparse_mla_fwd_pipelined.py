@@ -457,6 +457,7 @@ def test_sparse_mla_fwd_pipelined(B=1,
 
 
 if __name__ == "__main__":
+    print("haha")
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_correctness", action="store_true")
     args = parser.parse_args()
